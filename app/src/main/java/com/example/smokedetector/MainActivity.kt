@@ -1,15 +1,11 @@
 package com.example.smokedetector
 
 import android.Manifest
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.content.Context
+import android.content.*
 import android.content.pm.PackageManager
 import android.graphics.Color
-import android.media.AudioAttributes
-import android.media.Ringtone
-import android.media.RingtoneManager
-import android.os.*
+import android.os.Build
+import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -18,7 +14,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
-import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.button.MaterialButton
@@ -61,10 +57,6 @@ class HistoryAdapter(private val items: List<SmokeHistoryItem>) :
 
 class MainActivity : AppCompatActivity() {
 
-    private val baseGasUrl =
-        "https://script.google.com/macros/s/AKfycbw2irVWdtfZuSXizNhjKqvBSh2z9dfK5bcnuxUAI-qrUkVUuUe5pv4Y4ti_qg4kwdtu/exec"
-    private val channelId = "SMOKEGUARD_ALARM_CHANNEL"
-
     private lateinit var tvConnectionStatus: TextView
     private lateinit var tvStatusBadge: TextView
     private lateinit var progressSmoke: CircularProgressIndicator
@@ -77,18 +69,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvEmptyHistory: TextView
     private lateinit var rvHistory: RecyclerView
 
-    private val handler = Handler(Looper.getMainLooper())
     private var threshold = 5
-    private var isAlarmActive = false
-    private var activeRingtone: Ringtone? = null
-
     private val historyList = ArrayList<SmokeHistoryItem>()
     private lateinit var historyAdapter: HistoryAdapter
 
-    private val pollingRunnable = object : Runnable {
-        override fun run() {
-            fetchSmokeData()
-            handler.postDelayed(this, 5000)
+    private val dataReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            SmokeMonitorService.latestJsonData?.let { updateUiFromJson(it) }
         }
     }
 
@@ -112,23 +99,20 @@ class MainActivity : AppCompatActivity() {
         rvHistory.layoutManager = LinearLayoutManager(this)
         rvHistory.adapter = historyAdapter
 
-        createNotificationChannel()
         requestNotificationPermission()
+        startMonitorService()
 
-        // Nút giảm nhanh ngưỡng (Tiện demo khi thi)
         findViewById<MaterialButton>(R.id.btnMinus).setOnClickListener {
             val current = etThreshold.text.toString().toIntOrNull() ?: threshold
             val next = (current - 50).coerceAtLeast(1)
             etThreshold.setText(next.toString())
         }
 
-        // Nút tăng nhanh ngưỡng
         findViewById<MaterialButton>(R.id.btnPlus).setOnClickListener {
             val current = etThreshold.text.toString().toIntOrNull() ?: threshold
             etThreshold.setText((current + 50).toString())
         }
 
-        // Lưu ngưỡng lên Google Sheets
         findViewById<MaterialButton>(R.id.btnSaveThreshold).setOnClickListener {
             val input = etThreshold.text.toString().toIntOrNull()
             if (input != null && input > 0) {
@@ -139,30 +123,34 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Tắt chuông trực tiếp trên màn hình
         btnStopAlarm.setOnClickListener {
-            stopAlarmSound()
+            SmokeMonitorService.stopAlarm(this)
             btnStopAlarm.visibility = View.GONE
         }
 
-        handler.post(pollingRunnable)
+        // Hiển thị ngay dữ liệu gần nhất nếu Service đã chạy sẵn trước đó
+        SmokeMonitorService.latestJsonData?.let { updateUiFromJson(it) }
+    }
+
+    private fun startMonitorService() {
+        val serviceIntent = Intent(this, SmokeMonitorService::class.java)
+        ContextCompat.startForegroundService(this, serviceIntent)
     }
 
     private fun saveThresholdToServer(newVal: Int) {
         thread {
             try {
-                val url = URL("$baseGasUrl?action=set_threshold&value=$newVal")
+                val url = URL("${SmokeMonitorService.BASE_GAS_URL}?action=set_threshold&value=$newVal")
                 val conn = url.openConnection() as HttpURLConnection
                 conn.instanceFollowRedirects = true
                 conn.inputStream.bufferedReader().use { it.readText() }
 
                 runOnUiThread {
                     threshold = newVal
-                    isAlarmActive = false
                     tvThresholdDisplay.text = "Ngưỡng: $threshold"
                     Toast.makeText(this, "Đã cập nhật ngưỡng: $newVal", Toast.LENGTH_SHORT).show()
                 }
-            } catch (e: Exception) {
+            } catch (_: Exception) {
                 runOnUiThread {
                     Toast.makeText(this, "Lỗi mạng khi lưu ngưỡng", Toast.LENGTH_SHORT).show()
                 }
@@ -170,136 +158,75 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun fetchSmokeData() {
-        thread {
-            try {
-                val url = URL("$baseGasUrl?action=read")
-                val conn = url.openConnection() as HttpURLConnection
-                conn.instanceFollowRedirects = true
-                conn.connectTimeout = 4000
-                conn.readTimeout = 4000
+    private fun updateUiFromJson(response: String) {
+        try {
+            val json = JSONObject(response)
+            val smoke = json.getInt("smoke")
+            val updatedAt = json.getString("updated_at")
+            val serverThreshold = json.getInt("threshold")
+            val historyArr = json.getJSONArray("history")
 
-                val response = conn.inputStream.bufferedReader().use { it.readText() }
-                val json = JSONObject(response)
-                val smoke = json.getInt("smoke")
-                val updatedAt = json.getString("updated_at")
-                val serverThreshold = json.getInt("threshold")
-                val historyArr = json.getJSONArray("history")
-
-                val tempHistory = ArrayList<SmokeHistoryItem>()
-                for (i in 0 until historyArr.length()) {
-                    val item = historyArr.getJSONObject(i)
-                    tempHistory.add(
-                        SmokeHistoryItem(
-                            time = item.getString("time"),
-                            smoke = item.getInt("smoke"),
-                            threshold = item.getInt("threshold")
-                        )
+            val tempHistory = ArrayList<SmokeHistoryItem>()
+            for (i in 0 until historyArr.length()) {
+                val item = historyArr.getJSONObject(i)
+                tempHistory.add(
+                    SmokeHistoryItem(
+                        time = item.getString("time"),
+                        smoke = item.getInt("smoke"),
+                        threshold = item.getInt("threshold")
                     )
-                }
-
-                runOnUiThread {
-                    tvConnectionStatus.text = "● Đã kết nối trạm cảm biến (5s/lần)"
-                    tvConnectionStatus.setTextColor(Color.parseColor("#86EFAC"))
-
-                    threshold = serverThreshold
-                    if (!etThreshold.hasFocus()) {
-                        etThreshold.setText(threshold.toString())
-                    }
-
-                    tvCurrentSmoke.text = smoke.toString()
-                    tvThresholdDisplay.text = "Ngưỡng: $threshold"
-                    tvLastUpdate.text = "Cập nhật cảm biến: $updatedAt"
-
-                    // Cập nhật thanh đo vòng cung (tỉ lệ % so với ngưỡng)
-                    val percent = ((smoke.toFloat() / threshold.coerceAtLeast(1)) * 75).toInt().coerceIn(5, 100)
-                    progressSmoke.setProgressCompat(percent, true)
-
-                    // Cập nhật lịch sử
-                    historyList.clear()
-                    historyList.addAll(tempHistory)
-                    historyAdapter.notifyDataSetChanged()
-                    tvHistoryCount.text = "${historyList.size} sự kiện"
-                    tvEmptyHistory.visibility = if (historyList.isEmpty()) View.VISIBLE else View.GONE
-
-                    // Kiểm tra trạng thái báo động
-                    if (smoke >= threshold) {
-                        tvStatusBadge.text = "CẢNH BÁO: PHÁT HIỆN KHÓI!"
-                        tvStatusBadge.setTextColor(Color.parseColor("#DC2626"))
-                        tvStatusBadge.setBackgroundResource(R.drawable.bg_badge_danger)
-                        progressSmoke.setIndicatorColor(Color.parseColor("#DC2626"))
-                        tvCurrentSmoke.setTextColor(Color.parseColor("#DC2626"))
-
-                        if (!isAlarmActive) {
-                            isAlarmActive = true
-                            btnStopAlarm.visibility = View.VISIBLE
-                            triggerAlarm(smoke)
-                        }
-                    } else {
-                        tvStatusBadge.text = "KHÔNG KHÍ AN TOÀN"
-                        tvStatusBadge.setTextColor(Color.parseColor("#15803D"))
-                        tvStatusBadge.setBackgroundResource(R.drawable.bg_badge_safe)
-                        progressSmoke.setIndicatorColor(Color.parseColor("#10B981"))
-                        tvCurrentSmoke.setTextColor(Color.parseColor("#0F172A"))
-
-                        isAlarmActive = false
-                        btnStopAlarm.visibility = View.GONE
-                        stopAlarmSound()
-                    }
-                }
-            } catch (e: Exception) {
-                runOnUiThread {
-                    tvConnectionStatus.text = "● Đang thử kết nối lại máy chủ..."
-                    tvConnectionStatus.setTextColor(Color.parseColor("#FDE047"))
-                }
+                )
             }
-        }
-    }
 
-    private fun triggerAlarm(smokeVal: Int) {
-        val alarmUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
-            ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+            tvConnectionStatus.text = "● Đang chạy ngầm 24/7 (5s/lần)"
+            tvConnectionStatus.setTextColor(Color.parseColor("#86EFAC"))
 
-        // Phát chuông trực tiếp trên App để giám khảo nghe rõ khi demo
-        try {
-            stopAlarmSound()
-            activeRingtone = RingtoneManager.getRingtone(applicationContext, alarmUri)
-            activeRingtone?.play()
-        } catch (_: Exception) {}
+            threshold = serverThreshold
+            if (!etThreshold.hasFocus()) {
+                etThreshold.setText(threshold.toString())
+            }
 
-        // Đẩy thông báo hệ thống
-        val builder = NotificationCompat.Builder(this, channelId)
-            .setSmallIcon(android.R.drawable.ic_dialog_alert)
-            .setContentTitle("CẢNH BÁO KHÓI THUỐC LÁ!")
-            .setContentText("Phát hiện nồng độ khói $smokeVal (Vượt ngưỡng $threshold)")
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setCategory(NotificationCompat.CATEGORY_ALARM)
-            .setSound(alarmUri)
-            .setVibrate(longArrayOf(0, 500, 200, 500, 200, 500))
-            .setAutoCancel(true)
+            tvCurrentSmoke.text = smoke.toString()
+            tvThresholdDisplay.text = "Ngưỡng: $threshold"
+            tvLastUpdate.text = "Cập nhật cảm biến: $updatedAt"
 
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        manager.notify(1001, builder.build())
-    }
+            val percent = ((smoke.toFloat() / threshold.coerceAtLeast(1)) * 75).toInt().coerceIn(5, 100)
+            progressSmoke.setProgressCompat(percent, true)
 
-    private fun stopAlarmSound() {
-        try {
-            if (activeRingtone?.isPlaying == true) {
-                activeRingtone?.stop()
+            historyList.clear()
+            historyList.addAll(tempHistory)
+            historyAdapter.notifyDataSetChanged()
+            tvHistoryCount.text = "${historyList.size} sự kiện"
+            tvEmptyHistory.visibility = if (historyList.isEmpty()) View.VISIBLE else View.GONE
+
+            btnStopAlarm.visibility = if (SmokeMonitorService.isAlarmRinging) View.VISIBLE else View.GONE
+
+            if (smoke >= threshold) {
+                tvStatusBadge.text = "CẢNH BÁO: PHÁT HIỆN KHÓI!"
+                tvStatusBadge.setTextColor(Color.parseColor("#DC2626"))
+                tvStatusBadge.setBackgroundResource(R.drawable.bg_badge_danger)
+                progressSmoke.setIndicatorColor(Color.parseColor("#DC2626"))
+                tvCurrentSmoke.setTextColor(Color.parseColor("#DC2626"))
+            } else {
+                tvStatusBadge.text = "KHÔNG KHÍ AN TOÀN"
+                tvStatusBadge.setTextColor(Color.parseColor("#15803D"))
+                tvStatusBadge.setBackgroundResource(R.drawable.bg_badge_safe)
+                progressSmoke.setIndicatorColor(Color.parseColor("#10B981"))
+                tvCurrentSmoke.setTextColor(Color.parseColor("#0F172A"))
             }
         } catch (_: Exception) {}
     }
 
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val alarmSound = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
-            val audioAttr = AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).build()
-            val channel = NotificationChannel(channelId, "Cảnh báo khói thuốc", NotificationManager.IMPORTANCE_HIGH).apply {
-                setSound(alarmSound, audioAttr)
-                enableVibration(true)
-            }
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
-        }
+    override fun onStart() {
+        super.onStart()
+        val filter = IntentFilter(SmokeMonitorService.ACTION_DATA_UPDATED)
+        ContextCompat.registerReceiver(this, dataReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        startMonitorService()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        unregisterReceiver(dataReceiver)
     }
 
     private fun requestNotificationPermission() {
@@ -310,11 +237,5 @@ class MainActivity : AppCompatActivity() {
                 ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 101)
             }
         }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        stopAlarmSound()
-        handler.removeCallbacks(pollingRunnable)
     }
 }
